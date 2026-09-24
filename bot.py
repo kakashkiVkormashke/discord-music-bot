@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 DEFAULT_CHANNEL_ID = int(os.getenv('TEXT_CHANNEL_ID', '1429229290540503061'))
 CHANNEL_CONFIG_PATH = Path(os.getenv('CHANNEL_CONFIG_PATH', 'channels.json'))
+CHANNEL_NAME_SUFFIX = os.getenv('CHANNEL_NAME_SUFFIX', '_ms').strip().lower() or '_ms'
 PLAYLIST_BATCH_SIZE = max(1, min(int(os.getenv('PLAYLIST_BATCH_SIZE', '25')), 50))
 PLAYLIST_MAX_ITEMS = max(PLAYLIST_BATCH_SIZE, int(os.getenv('PLAYLIST_MAX_ITEMS', '300')))
 QUEUE_MAX_SIZE = 50
@@ -113,6 +114,19 @@ def extract_playlist(query):
     return {'title': title, 'items': items}
 
 
+def channel_config_candidates():
+    candidates = [CHANNEL_CONFIG_PATH]
+    if not CHANNEL_CONFIG_PATH.is_absolute():
+        candidates.append(Path('/tmp') / CHANNEL_CONFIG_PATH.name)
+    else:
+        candidates.append(Path('/tmp/channels.json'))
+    unique = []
+    for path in candidates:
+        if path not in unique:
+            unique.append(path)
+    return unique
+
+
 @dataclass
 class PlaylistSession:
     title: str
@@ -143,21 +157,42 @@ class MusicBot(discord.Client):
         self.channels = self.load_channels()
 
     def load_channels(self):
-        if not CHANNEL_CONFIG_PATH.exists():
-            return {}
-        try:
-            data = json.loads(CHANNEL_CONFIG_PATH.read_text(encoding='utf-8'))
-            return {int(guild_id): int(channel_id) for guild_id, channel_id in data.items()}
-        except (OSError, ValueError, TypeError):
-            log.warning('Could not read %s; using default channel only', CHANNEL_CONFIG_PATH)
-            return {}
+        for path in channel_config_candidates():
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding='utf-8'))
+                log.info('Loaded channel config from %s', path)
+                return {int(guild_id): int(channel_id) for guild_id, channel_id in data.items()}
+            except (OSError, ValueError, TypeError):
+                log.warning('Could not read %s; trying next channel config path', path)
+        return {}
 
     def save_channels(self):
         data = {str(guild_id): channel_id for guild_id, channel_id in self.channels.items()}
-        CHANNEL_CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        last_error = None
+        for path in channel_config_candidates():
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding='utf-8')
+                log.info('Saved channel config to %s', path)
+                return path
+            except OSError as error:
+                last_error = error
+                log.warning('Could not save channel config to %s: %s', path, error)
+        raise last_error or OSError('Could not save channel config')
 
-    def get_music_channel_id(self, guild_id):
-        return self.channels.get(guild_id, DEFAULT_CHANNEL_ID)
+    def is_auto_music_channel(self, channel):
+        return isinstance(channel, discord.TextChannel) and channel.name.lower().endswith(CHANNEL_NAME_SUFFIX)
+
+    def should_handle_channel(self, channel):
+        configured = self.channels.get(channel.guild.id)
+        if configured is not None:
+            return channel.id == configured
+        if self.is_auto_music_channel(channel):
+            return True
+        return channel.id == DEFAULT_CHANNEL_ID
 
     def state_for(self, guild_id):
         state = self.states.get(guild_id)
@@ -174,7 +209,7 @@ class MusicBot(discord.Client):
             log.warning('Could not send status message')
 
     async def on_ready(self):
-        log.info('Connected as %s; default_channel=%s; configured_guilds=%s', self.user, DEFAULT_CHANNEL_ID, len(self.channels))
+        log.info('Connected as %s; default_channel=%s; channel_suffix=%s; configured_guilds=%s', self.user, DEFAULT_CHANNEL_ID, CHANNEL_NAME_SUFFIX, len(self.channels))
 
     def clear_queue(self, state):
         while not state.queue.empty():
@@ -210,11 +245,11 @@ class MusicBot(discord.Client):
             return
         self.channels[message.guild.id] = channel_id
         try:
-            self.save_channels()
+            saved_to = self.save_channels()
         except OSError:
-            await self.say(message.channel, 'Канал применён до перезапуска, но не смог сохранить channels.json.')
+            await self.say(message.channel, f'Канал применён до перезапуска, но файл настройки сохранить не получилось. Можно не использовать lool: просто назови музыкальный канал с окончанием {CHANNEL_NAME_SUFFIX}.')
             return
-        await self.say(message.channel, f'Готово. На этом сервере слушаю только <#{channel_id}>.')
+        await self.say(message.channel, f'Готово. На этом сервере слушаю только <#{channel_id}>. Настройка сохранена в {saved_to}.')
 
     async def on_message(self, message):
         if message.author.bot or not message.guild:
@@ -228,7 +263,7 @@ class MusicBot(discord.Client):
             await self.configure_channel(message, parts)
             return
 
-        if message.channel.id != self.get_music_channel_id(message.guild.id):
+        if not self.should_handle_channel(message.channel):
             return
 
         state = self.state_for(message.guild.id)
