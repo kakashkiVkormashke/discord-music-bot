@@ -15,6 +15,9 @@ from dotenv import load_dotenv
 load_dotenv()
 DEFAULT_CHANNEL_ID = int(os.getenv('TEXT_CHANNEL_ID', '1429229290540503061'))
 CHANNEL_CONFIG_PATH = Path(os.getenv('CHANNEL_CONFIG_PATH', 'channels.json'))
+PLAYLIST_BATCH_SIZE = max(1, min(int(os.getenv('PLAYLIST_BATCH_SIZE', '25')), 50))
+PLAYLIST_MAX_ITEMS = max(PLAYLIST_BATCH_SIZE, int(os.getenv('PLAYLIST_MAX_ITEMS', '300')))
+QUEUE_MAX_SIZE = 50
 log = logging.getLogger('music')
 
 
@@ -27,6 +30,7 @@ def parse(text):
         'pause': {'пауза', 'поставь на паузу'},
         'resume': {'продолжи', 'продолжи музыку', 'сними с паузы'},
         'queue': {'очередь', 'покажи очередь'},
+        'playlist_next': {'дальше', 'еще', 'ещё', 'следующие', 'следующая пачка', 'загрузи дальше', 'докинь плейлист'},
     }
     for action, phrases in commands.items():
         if normalized in phrases:
@@ -35,37 +39,96 @@ def parse(text):
     return 'play', query
 
 
+def is_url(text):
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return False
+    return parsed.scheme in {'http', 'https'} and bool(parsed.netloc)
+
+
+def ydl_options(**extra):
+    options = {
+        'quiet': True,
+        'socket_timeout': 20,
+        'retries': 2,
+        'extractor_retries': 2,
+        'js_runtimes': {'deno': {}},
+    }
+    options.update(extra)
+    return options
+
+
 def extract(query):
-    if '://' in query:
-        url = urlparse(query)
-        if url.scheme not in {'https', 'http'} or url.hostname not in {
-            'youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be',
-        }:
-            raise ValueError('Нужна ссылка YouTube или название трека.')
+    if is_url(query):
         target = query
     else:
         target = 'ytsearch1:' + query
-    with yt_dlp.YoutubeDL({
-        'format': 'bestaudio/best', 'noplaylist': True, 'quiet': True,
-        'socket_timeout': 20, 'retries': 2, 'extractor_retries': 2,
-        'js_runtimes': {'deno': {}},
-    }) as ydl:
+    with yt_dlp.YoutubeDL(ydl_options(format='bestaudio/best', noplaylist=True)) as ydl:
         info = ydl.extract_info(target, download=False)
         if info and 'entries' in info:
             info = next((entry for entry in info['entries'] if entry), None)
         if not info or not info.get('url'):
-            raise ValueError('Ничего не найдено. Попробуй другое название.')
+            raise ValueError('Ничего не найдено. Попробуй другое название или ссылку.')
         return info
+
+
+def entry_to_query(entry):
+    webpage_url = entry.get('webpage_url')
+    if webpage_url:
+        return webpage_url
+    url = entry.get('url')
+    if url and is_url(url):
+        return url
+    if entry.get('ie_key') == 'Youtube' and entry.get('id'):
+        return 'https://www.youtube.com/watch?v=' + entry['id']
+    if url:
+        return url
+    title = entry.get('title')
+    if title:
+        return title
+    return None
+
+
+def extract_playlist(query):
+    if not is_url(query):
+        return None
+    with yt_dlp.YoutubeDL(ydl_options(extract_flat=True, noplaylist=False, playlistend=PLAYLIST_MAX_ITEMS)) as ydl:
+        info = ydl.extract_info(query, download=False)
+    entries = [entry for entry in (info or {}).get('entries') or [] if entry]
+    if not entries:
+        return None
+    items = []
+    seen = set()
+    for entry in entries[:PLAYLIST_MAX_ITEMS]:
+        item_query = entry_to_query(entry)
+        if not item_query or item_query in seen:
+            continue
+        seen.add(item_query)
+        title = entry.get('title') or item_query
+        items.append((item_query, title))
+    if not items:
+        return None
+    title = (info or {}).get('title') or 'плейлист'
+    return {'title': title, 'items': items}
+
+
+@dataclass
+class PlaylistSession:
+    title: str
+    items: list[tuple[str, str]]
+    offset: int = 0
 
 
 @dataclass
 class GuildState:
-    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=50))
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=QUEUE_MAX_SIZE))
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     voice: discord.VoiceClient | None = None
     worker: asyncio.Task | None = None
     generation: int = 0
     current: str | None = None
+    playlist: PlaylistSession | None = None
 
 
 class MusicBot(discord.Client):
@@ -118,6 +181,20 @@ class MusicBot(discord.Client):
             state.queue.get_nowait()
             state.queue.task_done()
 
+    def enqueue_playlist_batch(self, state, channel):
+        if not state.playlist:
+            return 0, 0
+        free_slots = state.queue.maxsize - state.queue.qsize()
+        if free_slots <= 0:
+            return 0, len(state.playlist.items) - state.playlist.offset
+        amount = min(PLAYLIST_BATCH_SIZE, free_slots, len(state.playlist.items) - state.playlist.offset)
+        start = state.playlist.offset
+        for item_query, title in state.playlist.items[start:start + amount]:
+            state.queue.put_nowait((channel, item_query, title))
+        state.playlist.offset += amount
+        left = len(state.playlist.items) - state.playlist.offset
+        return amount, left
+
     async def configure_channel(self, message, parts):
         perms = message.author.guild_permissions
         if not (perms.manage_guild or perms.administrator):
@@ -156,6 +233,13 @@ class MusicBot(discord.Client):
 
         state = self.state_for(message.guild.id)
         action, query = parse(text)
+        playlist = None
+        if action == 'play' and query and is_url(query):
+            try:
+                playlist = await asyncio.to_thread(extract_playlist, query)
+            except Exception as error:
+                log.warning('Playlist extraction failed in guild %s: %s', message.guild.id, type(error).__name__)
+
         async with state.lock:
             member_voice = getattr(message.author, 'voice', None)
             target = member_voice.channel if member_voice else None
@@ -168,13 +252,18 @@ class MusicBot(discord.Client):
                 return
             state.voice = vc
             if action == 'queue':
-                upcoming = [item[1] for item in list(state.queue._queue)]
-                await self.say(message.channel, 'Сейчас: ' + (state.current or 'тишина') + '\nОчередь:\n' + ('\n'.join(upcoming[:15]) or 'пуста'))
+                upcoming = [item[2] for item in list(state.queue._queue)]
+                tail = ''
+                if state.playlist:
+                    left = len(state.playlist.items) - state.playlist.offset
+                    tail = f'\nПлейлист: {state.playlist.title}, осталось не загружено: {left}'
+                await self.say(message.channel, 'Сейчас: ' + (state.current or 'тишина') + '\nОчередь:\n' + ('\n'.join(upcoming[:15]) or 'пуста') + tail)
                 return
             if action == 'stop':
                 state.generation += 1
                 self.clear_queue(state)
                 state.current = None
+                state.playlist = None
                 if vc:
                     vc.stop()
                     await vc.disconnect()
@@ -187,6 +276,15 @@ class MusicBot(discord.Client):
                     vc.stop()
                 await self.say(message.channel, 'Перехожу к следующему треку.')
                 return
+            if action == 'playlist_next':
+                added, left = self.enqueue_playlist_batch(state, message.channel)
+                if added:
+                    await self.say(message.channel, f'Докинул из плейлиста: {added}. Осталось не загружено: {left}.')
+                elif state.playlist:
+                    await self.say(message.channel, 'Очередь заполнена или плейлист уже закончился.')
+                else:
+                    await self.say(message.channel, 'Сначала скинь ссылку на плейлист.')
+                return
             if action in {'pause', 'resume'}:
                 if vc and action == 'pause' and vc.is_playing():
                     vc.pause()
@@ -198,10 +296,10 @@ class MusicBot(discord.Client):
                     await self.say(message.channel, 'Сейчас нет трека для этого действия.')
                 return
             if not query or len(query) > 500:
-                await self.say(message.channel, 'Напиши название или ссылку YouTube длиной до 500 символов.')
+                await self.say(message.channel, 'Напиши название или ссылку длиной до 500 символов.')
                 return
             if state.queue.full():
-                await self.say(message.channel, 'Очередь заполнена (50 запросов).')
+                await self.say(message.channel, f'Очередь заполнена ({QUEUE_MAX_SIZE} запросов).')
                 return
             if not vc or not vc.is_connected():
                 try:
@@ -209,15 +307,20 @@ class MusicBot(discord.Client):
                 except (discord.DiscordException, asyncio.TimeoutError):
                     await self.say(message.channel, 'Не удалось подключиться. Проверь мои права Connect и Speak.')
                     return
-            state.queue.put_nowait((message.channel, query))
+            if playlist:
+                state.playlist = PlaylistSession(playlist['title'], playlist['items'])
+                added, left = self.enqueue_playlist_batch(state, message.channel)
+                await self.say(message.channel, f'Плейлист найден: {discord.utils.escape_markdown(state.playlist.title)}. Добавил {added} треков, осталось не загружено: {left}. Напиши «дальше», чтобы докинуть следующую порцию.')
+                return
+            state.queue.put_nowait((message.channel, query, query))
             await self.say(message.channel, 'Добавлено: ' + discord.utils.escape_markdown(query))
 
     async def player(self, guild_id, state):
         while True:
-            channel, query = await state.queue.get()
+            channel, query, label = await state.queue.get()
             version = state.generation
             vc = state.voice
-            state.current = query
+            state.current = label
             source = None
             try:
                 info = await asyncio.to_thread(extract, query)
@@ -238,7 +341,7 @@ class MusicBot(discord.Client):
                     )
                     vc.play(source, after=lambda error: loop.call_soon_threadsafe(finish, error))
                     source = None
-                    state.current = info.get('title', query)
+                    state.current = info.get('title', label or query)
                 await self.say(channel, 'Играет: ' + discord.utils.escape_markdown(state.current or query))
                 error = await done
                 if error:
